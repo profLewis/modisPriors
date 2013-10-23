@@ -252,7 +252,7 @@ class globAlbedo():
       sys.stderr.write('error opening genPnw.Pnw for writing in %s'%self.here)
       return
     # copy over genPnw.py
-    cmd = 'cp bin/genPnw.py source'
+    cmd = 'cp files/python/genPnw.py source'
     try:
       os.system(cmd)
     except:
@@ -294,23 +294,21 @@ class globAlbedo():
     return
 
 
+from albedo_pix import processArgs
 
 if __name__ == '__main__':
-  srcdir = '/data/geospatial_11/plewis/TILE/data'
+  srcdir = './files'
 
   sdims=None
   years=None
   focus=None
-  shrink=2
+  shrink=1
   scale=None
-  bands=[7,8,9]
+  bands=range(0,7)
+  type=['NoSnow']
+  stage = '1'
+  tile = 'h18v03'
 
-  # set up this utility passing through any obvious options
-  self = globAlbedo(srcdir,sdims=sdims,years=years,\
-             focus=focus,shrink=shrink,scale=scale,bands=bands)
-
-  # prep
-  self.prep()
 
   isRun = False
   isReport = False
@@ -322,6 +320,20 @@ if __name__ == '__main__':
   if '--report' in sys.argv:
     isReport = True
     sys.argv.remove('--report')
+
+  
+  opts, args = processArgs()
+
+  tile = opts.tile
+  opts.stage = opts.stage
+
+  # set up this utility passing through any obvious options
+  self = globAlbedo(srcdir,sdims=sdims,years=years,\
+             stage=stage,type=type,tile=tile,\
+             focus=focus,shrink=shrink,scale=scale,bands=bands)
+
+  # prep
+  self.prep()
 
   # run the stage or just report?
   if isRun:

@@ -17,8 +17,8 @@ import sys, os
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 
-# /data/netapp_3/plewis/modisPriors/files/python here is a placeholder for this directory
-sys.path.insert(0, os.path.abspath('/data/netapp_3/plewis/modisPriors/files/python'))
+# /data/netapp_3/plewis/modisPriors/python here is a placeholder for this directory
+sys.path.insert(0, os.path.abspath('/data/netapp_3/plewis/modisPriors/python'))
 sys.path.insert(0, os.path.abspath('.'))
 
 # -- General configuration -----------------------------------------------------

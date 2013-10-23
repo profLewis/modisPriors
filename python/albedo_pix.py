@@ -17,6 +17,8 @@ __status__ = "Production"
 import numpy as np
 import sys,os,datetime,math,ast,glob,resource
 from pyhdf import SD
+#import gdal
+
 from optparse import OptionParser
 #the two imports below are needed if you want to save the output in ENVI format, but they conflict with the netcdf code, so commented out.
 #from osgeo import gdal
@@ -1722,6 +1724,8 @@ def processArgs(args=None,parser=None):
 
     # Lewis: add defaults here
 
+    parser.add_option('--stage',dest='stage',type='string',default='1',\
+                      help='set stage')
     parser.add_option('--clean',dest='clean',action='store_true',default=False,\
                       help="ignore previous cdf files")
     parser.add_option('--dontclean',dest='clean',action='store_false',\

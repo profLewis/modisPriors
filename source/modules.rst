@@ -9,3 +9,7 @@ python
    genPnw
    globAlbedo
    kernels
+   plotter
+   prior2Fast
+   pyhdf
+   stage1Prior
