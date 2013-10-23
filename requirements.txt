@@ -1,4 +1,3 @@
 netCDF4
 cloud_sptheme
-optparse
-subprocess
+pyhdf
