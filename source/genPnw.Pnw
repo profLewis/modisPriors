@@ -1,0 +1,9 @@
+
+Generate data pages
+---------------------
+
+<<results = "rst">>=
+from genPnw import *
+genIndex('results',tile='h17v03',stage=1)
+@
+
