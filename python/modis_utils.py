@@ -444,7 +444,7 @@ class modis_utils():
            
             hdf = SD.SD(fileName)
 	    # allocate array for all bands
-            data = np.zeros((nBands,) + QA.shape + (3,))
+            data = np.zeros((3, nBands,) + QA.shape)
 	    # loop over bands 
             for i in range(nBands):
                 self.logging.info( '  ... band %d'%i,extra=self.d)
@@ -454,7 +454,7 @@ class modis_utils():
                 #filter out duff values
                 for j in range(3):
                   goodData = goodData & (ithis[:,:,j] != duff)
-	        data[i] = scale * ithis
+	          data[j,i] = scale * ithis
             hdf.end()
             
             self.logging.info( 'done ...',extra=self.d)
@@ -477,25 +477,14 @@ class modis_utils():
 
             weight = backupscale ** band_quality
 
-	    if masked:
-	      self.logging.info( ' ...sorting mask...',extra=self.d)
-	      nmask = ~goodData
-	      land      = ma.array(land,mask=nmask)
-              weight    = ma.array(weight,mask=nmask)
-              snow_mask = ma.array(snow_mask,mask=nmask)
-              #fmask = np.tile(nmask,(3,1))
-              fmask = np.array([np.array([nmask] * 3).T] * nBands)
-	      data = ma.array(data,mask=fmask)
-            else:
-              self.logging.info( ' ...sorting mask...',extra=self.d)
-              mask = goodData
-              land      = land * mask
-              weight    = weight * mask
-              snow_mask = snow_mask * mask
-              #fmask = np.tile(nmask,(3,1))
-              #fmask = np.array([np.array([nmask] * 3).T] * nBands)
-              # NB this changes the data set shape around
-              data = np.array([data[:,:,:,k] * mask for k in xrange(3)])
+            self.logging.info( ' ...sorting mask...',extra=self.d)
+            mask = goodData
+            land      = land * mask
+            weight    = weight * mask
+            snow_mask = snow_mask * mask
+            # NB this changes the data set shape around
+            # so its data[0-3,nb,:,:]
+            data *= mask
  
             retval = {'error':False,'ns':ns,'nl':nl,'nb':nBands,\
 			'land':land,'weight':weight,\
