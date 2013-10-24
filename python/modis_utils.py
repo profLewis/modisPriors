@@ -483,7 +483,7 @@ class modis_utils():
             snow_mask = snow_mask * mask
             # NB this changes the data set shape around
             # so its data[0-3,nb,:,:]
-            data = idata * mask
+            data = data * mask
  
             retval = {'error':False,'ns':ns,'nl':nl,'nb':nBands,\
 			'land':land,'weight':weight,\
@@ -1787,8 +1787,7 @@ if __name__ == '__main__':
     doy = 9
     tile = 'h17v03'
     sum = m.sum_samples(all_files,doy,tile)
-    sumwt = np.array([np.array([sum['weight']] * 3).T] * sum['nb'])
-    d = sum['data']/sumwt
+    #d = sum['data']/sumwt
     opts, args = processArgs()
 
     # Lewis: need str at times on the eval 
