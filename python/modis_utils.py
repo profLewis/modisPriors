@@ -327,7 +327,7 @@ class modis_utils():
 
     def getModisAlbedo(self,fileName,QaFile,bands=[0,1,2,3,4,5,6],\
                         snow=False,no_snow=True,\
-			masked=False,sdim=[-1,-1,-1,-1],backupscale=0.61803398875):
+			sdim=[-1,-1,-1,-1],backupscale=0.61803398875):
         """
         Extract data from MODIS data file (C5)
 
@@ -343,7 +343,6 @@ class modis_utils():
 
         snow        : process snow pixels
         no_snow     : process no_snow pixels
-	masked      : return masked arrays
 	bands       : array e.g. [0,1,2,3,4,5,6]
         sdim        : array [-1,-1,-1,-1] used to ectract subset / subsample. 
                       The format is [s0,ns,l0,nl]
@@ -444,7 +443,7 @@ class modis_utils():
            
             hdf = SD.SD(fileName)
 	    # allocate array for all bands
-            data = np.zeros((3, nBands,) + QA.shape)
+            data = np.zeros((3, nBands) + QA.shape)
 	    # loop over bands 
             for i in range(nBands):
                 self.logging.info( '  ... band %d'%i,extra=self.d)
@@ -454,7 +453,7 @@ class modis_utils():
                 #filter out duff values
                 for j in range(3):
                   goodData = goodData & (ithis[:,:,j] != duff)
-	          data[j,i] = scale * ithis
+	          data[j,i] = scale * ithis[:,:,j]
             hdf.end()
             
             self.logging.info( 'done ...',extra=self.d)
@@ -484,7 +483,7 @@ class modis_utils():
             snow_mask = snow_mask * mask
             # NB this changes the data set shape around
             # so its data[0-3,nb,:,:]
-            data *= mask
+            data = idata * mask
  
             retval = {'error':False,'ns':ns,'nl':nl,'nb':nBands,\
 			'land':land,'weight':weight,\
