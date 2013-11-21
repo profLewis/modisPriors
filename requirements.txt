@@ -1,3 +1,5 @@
-netCDF4
-cloud_sptheme
-pyhdf
+netCDF4>1.0
+cloud_sptheme>1.0
+http://www.hdfgroup.org/ftp/HDF/HDF_Current/bin/linux-x86_64/hdf-4.2.9-linux-x86_64.tar.gz
+http://downloads.sourceforge.net/project/pysclint/pyhdf/0.8.3/pyhdf-0.8.3.tar.gz
+

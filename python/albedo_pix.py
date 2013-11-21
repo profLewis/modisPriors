@@ -17,8 +17,6 @@ __status__ = "Production"
 import numpy as np
 import sys,os,datetime,math,ast,glob,resource
 from pyhdf import SD
-#import gdal
-
 from optparse import OptionParser
 #the two imports below are needed if you want to save the output in ENVI format, but they conflict with the netcdf code, so commented out.
 #from osgeo import gdal
@@ -55,8 +53,7 @@ def insensitive_glob(pattern):
         return '[%s%s]'%(c.lower(),c.upper()) if c.isalpha() else c
     return glob.glob(''.join(map(either,pattern)))
 
-class albedo_pix():
-    """
+    
     Calculate mean and variation in albedo for albedo climatology.
 
     Initialise as:
@@ -73,8 +70,6 @@ class albedo_pix():
                       available
         ``clean`` : boolean flag to determine whether previously calculated netCDF files
                        should be read rather than re-calculating from the MODIS hdf files.
-        ``rst`` : ReST directory name (e.g. `source`). 
-                     Set to the string 'None' for no ReST output.
         ``logfile`` : log file name (string)
 
         ``logdir`` : directory for log file (string)
@@ -112,8 +107,6 @@ class albedo_pix():
 
         ``dontwithsnow`` : don't output snow and non-snow (combined) data
 
-        ``rstbase``  : base name for ReST files
-
     """    
     def __init__(self,inputs):
         """
@@ -128,6 +121,29 @@ class albedo_pix():
 
         #constructor
         self.ip = inputs
+        try:
+          self.logfile = self.ip.logfile
+          self.logdir  = self.ip.logdir
+          self.focus   = self.ip.focus
+          self.years   = self.ip.years
+          self.product = self.ip.product
+          self.tile    = self.ip.tile
+          self.version = self.ip.version
+          self.srcdir  = self.ip.srcdir
+          self.bands   = self.ip.bands
+          self.shrink  = self.ip.shrink
+
+        except:
+          self.logfile = self.ip['logfile']
+          self.logdir  = self.ip['logdir']
+          self.focus   = self.ip['focus']
+          self.years   = self.ip['years']
+          self.product = self.ip['product']
+          self.tile    = self.ip['tile']
+          self.version = self.ip['version']
+          self.srcdir  = self.ip['srcdir']
+          self.bands   = self.ip['bands']
+          self.shrink  = self.ip['shrink']
         
         self.a1Files = None
         self.a2Files = None
@@ -136,10 +152,19 @@ class albedo_pix():
         # threshold sd to 1.0 
         self.maxvar = 1.0
         self.minvar = 1e-20
-       
+
+        # set up logging
+        self.set_logging(self.logdir,self.logfile)
+      
+        if len(self.focus) != len(self.years):
+          logging.warning('warning: inconsistent number of years defined for --years and --focus',extra=self.d)
+          logging.warning('setting focus to 1.0 for all years',extra=self.d)
+          inputs.focus = np.ones_like(self.years.astype(float))
+
+    def set_logging(self,logdir,logfile)
         # logging
-        if os.path.exists(self.ip.logdir) == 0:
-          os.makedirs(self.ip.logdir)
+        if os.path.exists(logdir) == 0:
+          os.makedirs(logdir)
         try:
           from socket import gethostname, gethostbyname
           self.clientip = gethostbyname(gethostname()) 
@@ -150,16 +175,12 @@ class albedo_pix():
           self.user = getpass.getuser()
         except:
           self.user = ''
-        self.log = self.ip.logdir + '/' + self.ip.logfile
+        self.log = logdir + '/' + logfile
         logging.basicConfig(filename=self.log,\
                      filemode='w+',level=logging.DEBUG,\
                      format='%(asctime)-15s %(clientip)s %(user)-8s %(message)s')
         self.d = {'clientip': self.clientip, 'user': self.user}
         logging.info("__version__ %s"%__version__,extra=self.d)
-        if len(inputs.focus) != len(inputs.years):
-          logging.warning('warning: inconsistent number of years defined for --years and --focus',extra=self.d)
-          logging.warning('setting focus to 1.0 for all years',extra=self.d)
-          inputs.focus = np.ones_like(inputs.years.astype(float))
         print "logging to %s"%self.log
         # set an id for files
         try:
@@ -236,8 +257,6 @@ class albedo_pix():
 
         return this
 
-
-
     def getValidFiles(self,yearList,doy):
 
         """       
@@ -257,19 +276,20 @@ class albedo_pix():
         Returns
         -------
 
-        dictionary : {A1FILES:string array,A2FILES:string array}
+        dictionary : A1FILES,A2FILES.weighting
 
         where:
 
-        A1FILES : data files
-        A2FILES : QA files
+        A1FILES  : data files
+        A2FILES  : QA files
+        weighting: focus
 
         """
         if(self.a1Files==None):
-            product = self.ip.product
-            tile = self.ip.tile
-            version = self.ip.version
-            srcdir = self.ip.srcdir
+            product = self.product
+            tile = self.tile
+            version = self.version
+            srcdir = self.srcdir
             doy = '%03d'%int(doy)
             self.a1Files = []
             self.a2Files = []
@@ -287,8 +307,8 @@ class albedo_pix():
                   a1 = insensitive_glob(srcdir+'/'+'*'+product+'1.A'+year+str(doy)+'.'+tile+'.'+version+'.*.hdf')
 
                 if len(a2) == 0 or len(a1) == 0:
-                  a2.extend(insensitive_glob(self.ip.srcdir+'/'+'*'+self.ip.product+'2/%s/*.A%s%s.%s.*hdf'%(year,year,str(doy),self.ip.tile)))
-                  a1.extend(insensitive_glob(self.ip.srcdir+'/'+'*'+self.ip.product+'1/%s/*.A%s%s.%s.*hdf'%(year,year,str(doy),self.ip.tile)))
+                  a2.extend(insensitive_glob(self.srcdir+'/'+'*'+self.product+'2/%s/*.A%s%s.%s.*hdf'%(year,year,str(doy),self.tile)))
+                  a1.extend(insensitive_glob(self.srcdir+'/'+'*'+self.product+'1/%s/*.A%s%s.%s.*hdf'%(year,year,str(doy),self.tile)))
 
 
                 if len(a1) == 0 or len(a2) == 0 :
@@ -301,7 +321,7 @@ class albedo_pix():
                 else:
                     self.a1Files.append(a1[0])
                     self.a2Files.append(a2[0])
-                    self.weighting.append(self.ip.focus[i])
+                    self.weighting.append(self.focus[i])
                     logging.info( a1[0],extra=self.d)
        
         return self.a1Files,self.a2Files,self.weighting
@@ -411,12 +431,12 @@ class albedo_pix():
         see https://lpdaac.usgs.gov/products/modis_products_table/mcd43a2
                                     
         """
-        bands = self.ip.bands
+        bands = self.bands
 
         duff = long(32767)
         oneScale = 1000
         scale = 1.0/oneScale
-        nBands = len(self.ip.bands)
+        nBands = len(self.bands)
         mask = 3
         #get the data size
         logging.info( '...reading qa... %s'%QaFile,extra=self.d)
@@ -667,15 +687,15 @@ class albedo_pix():
                 weight[i,:,:,j] = samplesN
 
         # shrink the data
-        sweight = np.zeros((nb,ns/self.ip.shrink,nl/self.ip.shrink,3),dtype=float)
-        sdata = np.zeros((nb,ns/self.ip.shrink,nl/self.ip.shrink,3),dtype=float)
+        sweight = np.zeros((nb,ns/self.shrink,nl/self.shrink,3),dtype=float)
+        sdata = np.zeros((nb,ns/self.shrink,nl/self.shrink,3),dtype=float)
 
         # so sweightdata is the observations multiplied by the weight
         sweightdata = samples['data']*weight
         for i in xrange(nb):
           for j in xrange(3):
-            sweight[i,:,:,j] = self.shrunk(weight[i,:,:,j],ns,nl,self.ip.shrink)
-            sdata[i,:,:,j] = self.shrunk(sweightdata[i,:,:,j],ns,nl,self.ip.shrink)
+            sweight[i,:,:,j] = self.shrunk(weight[i,:,:,j],ns,nl,self.shrink)
+            sdata[i,:,:,j] = self.shrunk(sweightdata[i,:,:,j],ns,nl,self.shrink)
             ww = np.where(sweight[i,:,:,j]>0)
             sdata[i,:,:,j][ww] /= sweight[i,:,:,j][ww]
         # now sdata is re-normalised so its just the data again
@@ -751,6 +771,7 @@ class albedo_pix():
                        
 
         """
+self.backupscale = self.ip.backupscale
         self.a1Files = None
         self.a2Files = None
         a1Files, a2Files, weighting = self.getValidFiles(yearList,doy[0])
@@ -764,7 +785,7 @@ class albedo_pix():
         # try to file at least one file that works ...
         while not foundOne: 
           thisData = self.getModisAlbedo(a1Files[thisOne],a2Files[thisOne],\
-                          sdmins,np.asarray(self.ip.backupscale)*weighting[thisOne])
+                          sdmins,np.asarray(self.backupscale)*weighting[thisOne])
           if thisData['err'] != 0:
             thisOne += 1
             logging.warning('error in getModisAlbedo for %s %s'%(a1Files[thisOne],a2Files[thisOne]),extra=self.d)
@@ -1724,8 +1745,6 @@ def processArgs(args=None,parser=None):
 
     # Lewis: add defaults here
 
-    parser.add_option('--stage',dest='stage',type='string',default='1',\
-                      help='set stage')
     parser.add_option('--clean',dest='clean',action='store_true',default=False,\
                       help="ignore previous cdf files")
     parser.add_option('--dontclean',dest='clean',action='store_false',\
