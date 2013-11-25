@@ -25,6 +25,10 @@ from subprocess import check_call
 import netCDF4 as nc
 import logging
 from scipy import stats
+import cPickle as pickle
+import zlib
+import pp
+import numpy.ma as ma
 
 def insensitive_glob(pattern):
     """ From: http://stackoverflow.com/questions/8151300/ignore-case-in-glob-on-linux
@@ -53,14 +57,19 @@ def insensitive_glob(pattern):
         return '[%s%s]'%(c.lower(),c.upper()) if c.isalpha() else c
     return glob.glob(''.join(map(either,pattern)))
 
-    
-    Calculate mean and variation in albedo for albedo climatology.
+class dummy():
+    def __init__(self):
+      self.info = self.error = self.warning = None
+
+class prep_modis():
+    """  
+    Prepare and interpret MODIS MCD43 data
 
     Initialise as:
 
     ::
 
-        al = albedo_pix(inputs)
+        al = prep_modis(inputs)
 
 
     where ``inputs`` should contain (e.g. ``inputs.clean = True``):
@@ -68,8 +77,6 @@ def insensitive_glob(pattern):
         ``doyList`` : list of strings identifying which days to process
                       e.g. ['001','009'] or set to None to select all
                       available
-        ``clean`` : boolean flag to determine whether previously calculated netCDF files
-                       should be read rather than re-calculating from the MODIS hdf files.
         ``logfile`` : log file name (string)
 
         ``logdir`` : directory for log file (string)
@@ -78,37 +85,30 @@ def insensitive_glob(pattern):
 
         ``tile``   : MODIS tile ID
 
-        ``backupscale`` : Array defining the scale to map MODIS QA flags to, e.g. [1.,0.7,0.49,0.343]
+        ``backupscale`` : Array defining the scale to map MODIS QA flags to, e.g. 0.6
 
         ``opdir`` : Output directory
 
-        ``compression`` : Compress output file (boolean flag)
-
         ``shrink`` : spatial shrink factor (integer) 
 
-        ``sdims`` : image subsection: default [-1,-1,-1,-1] or [l0,nl,s0,ns]
+        ``sdim`` : image subsection: default [-1,-1,-1,-1] or [l0,nl,s0,ns]
 
         ``bands`` : list of bands to process. e.g. [7,8,9]
 
         ``years`` : list of years to process e.g. 
                 [2000,2001,2002,2003,2004,2005,2006,2007,2008,2009,2010,2011,2012,2013]
 
-        ``focus`` : list or weights for years to process (defaults to 1.0)
-
         ``version`` : MODIS collection number (as string). e.g. 005
 
         ``product`` : product name e.g. mcd43a (case insensitive)
 
-        ``part`` : How many parts to split the tile into e.g. 1
+        ``snow`` :  output snow data
 
-        ``dontsnow`` : don't output snow data
+        ``no_snow`` :  output no_snow data
 
-        ``dontnosnow`` : don't output non-snow data
-
-        ``dontwithsnow`` : don't output snow and non-snow (combined) data
 
     """    
-    def __init__(self,inputs):
+    def __init__(self,inputs=None):
         """
         Class constructor
 
@@ -120,11 +120,57 @@ def insensitive_glob(pattern):
         """
 
         #constructor
+        self.default_settings(inputs)
+ 
+        self.a1Files = []
+        self.a2Files = []
+
+        # set up logging and opdir
+        self.logging = dummy()
+        self.logging.info = self.logging.error = self.logging.warning = self.no_log
+        self.d = ''
+        if self.logfile:
+          self.set_logging(self.logdir,self.logfile)
+      
+        if not os.path.exists(self.opdir):
+          os.makedirs(self.opdir)
+        # return a list of valid hdf files
+        for doy in self.doyList or np.arange(1,366,8):
+          a1,a2 = self.getValidFiles(self.years,doy)
+          self.a1Files.extend(a1)
+          self.a2Files.extend(a2)
+
+    def no_log(self,msg,extra=''):
+        '''
+        Default logging - put to stderr
+        '''
+        import sys
+        sys.stdout.write('%s: %s\n'%(extra,msg))
+
+    def default_settings(self,inputs):
         self.ip = inputs
+        if inputs == None:
+          self.doyList = None
+          self.logfile = None
+          self.logdir  = 'logs'
+          self.years   = np.arange(2000,2100)
+          self.product = 'MCD43A'
+          self.tile    = 'h18v03'
+          self.version = '005'
+          self.srcdir  = '.'
+          self.bands   = np.arange(7)
+          self.shrink  = 1
+          self.opdir   = 'results'
+          self.sdim    = [-1,-1,-1,-1]
+          self.backupscale = 0.61803398875 # ^ band_quality
+          self.snow    = True 
+          self.no_snow = True
+          return
+
         try:
+          self.doyList = self.ip.doyList 
           self.logfile = self.ip.logfile
           self.logdir  = self.ip.logdir
-          self.focus   = self.ip.focus
           self.years   = self.ip.years
           self.product = self.ip.product
           self.tile    = self.ip.tile
@@ -132,11 +178,15 @@ def insensitive_glob(pattern):
           self.srcdir  = self.ip.srcdir
           self.bands   = self.ip.bands
           self.shrink  = self.ip.shrink
-
+          self.opdir   = self.ip.opdir
+          self.sdim    = self.ip.sdim
+          self.backupscale = self.ip.backupscale
+          self.snow    = self.ip.snow
+          self.no_snow = self.ip.no_snow  
         except:
+          self.doyList = self.ip['doyList'] 
           self.logfile = self.ip['logfile']
           self.logdir  = self.ip['logdir']
-          self.focus   = self.ip['focus']
           self.years   = self.ip['years']
           self.product = self.ip['product']
           self.tile    = self.ip['tile']
@@ -144,25 +194,60 @@ def insensitive_glob(pattern):
           self.srcdir  = self.ip['srcdir']
           self.bands   = self.ip['bands']
           self.shrink  = self.ip['shrink']
-        
-        self.a1Files = None
-        self.a2Files = None
-        self.weighting = None
+          self.opdir   = self.ip['opdir']
+          self.sdim    = self.ip['sdim']
+          self.backupscale = self.ip['backupscale']
+          self.snow    = self.ip['snow']
+          self.no_snow = self.ip['no_snow']
 
-        # threshold sd to 1.0 
-        self.maxvar = 1.0
-        self.minvar = 1e-20
+    def translate(self,filename,QaFile,refl=None,bands=None,data=None):
+      '''
+      We want the processing to be per waveband
+      for all years for stage 1
 
-        # set up logging
-        self.set_logging(self.logdir,self.logfile)
-      
-        if len(self.focus) != len(self.years):
-          logging.warning('warning: inconsistent number of years defined for --years and --focus',extra=self.d)
-          logging.warning('setting focus to 1.0 for all years',extra=self.d)
-          inputs.focus = np.ones_like(self.years.astype(float))
+      So we have to store nyears of weight etc (data)
+      that we need for processing, and refl[nyears]
+      '''
+      b = bands or self.bands
+      # loop over bands
+      data = self.getModisAlbedo(filename,QaFile,\
+                snow=self.snow,no_snow=self.no_snow,dataw=data,\
+		bands=np.array([b]),sdim=self.sdim,backupscale=self.backupscale)
+      if data['error']:
+        return None
+      data['year'] = filename.split('/')[-1].split('.')[1][1:5]
+      data['doy'] = filename.split('/')[-1].split('.')[1][5:]
+      data['data'] = (1000*data['data']).astype(np.uint16)
+      data['weight'] = (1000*data['weight']).astype(np.uint16)
+      return data
 
-    def set_logging(self,logdir,logfile)
+    def testing(self):
+      # organise the data by doy for all years
+      # we need to get the data ordered so that year varies first
+      # then doy then anything else
+      iofile = self.opdir + '/'+ self.product+'.'+self.tile+'.'+data['doy']+'_base.pkl'
+      # and by band
+      fp = [None]*len(self.bands)
+      files = [None]*len(self.bands)
+      for i,b in enumerate(self.bands):
+        iofiles = iofile.replace('base.pkl','band_%08d.bin'%b)
+        if iofiles == files[i]:
+          self.logging.info('appending to %s ...'%iofiles,extra=self.d)
+        else:
+          if fp[i] != None:
+            fp[i].close()
+          self.logging.info('writing to %s ...'%iofiles,extra=self.d)
+          fp[i] = open(iofiles, 'wb')
+        np.save(fp[i], data['data'][:,i])
+      del data['data']
+      self.logging.info('writing to %s ...'%iofile,extra=self.d) 
+      fp = open(iofile, 'wb+')
+      pickle.dump(data, fp)
+      return True
+
+    def set_logging(self,logdir,logfile):
         # logging
+        self.logging = logging
         if os.path.exists(logdir) == 0:
           os.makedirs(logdir)
         try:
@@ -176,11 +261,11 @@ def insensitive_glob(pattern):
         except:
           self.user = ''
         self.log = logdir + '/' + logfile
-        logging.basicConfig(filename=self.log,\
-                     filemode='w+',level=logging.DEBUG,\
+        self.logging.basicConfig(filename=self.log,\
+                     filemode='w+',level=self.logging.DEBUG,\
                      format='%(asctime)-15s %(clientip)s %(user)-8s %(message)s')
         self.d = {'clientip': self.clientip, 'user': self.user}
-        logging.info("__version__ %s"%__version__,extra=self.d)
+        self.logging.info("__version__ %s"%__version__,extra=self.d)
         print "logging to %s"%self.log
         # set an id for files
         try:
@@ -225,8 +310,8 @@ def insensitive_glob(pattern):
 
         yearList = np.sort(np.unique(yearList))
         doyList = np.sort(np.unique(doyList))
-        logging.info(str(yearList),extra=self.d)
-        logging.info(str(doyList),extra=self.d)
+        self.logging.info(str(yearList),extra=self.d)
+        self.logging.info(str(doyList),extra=self.d)
 
         return doyList, yearList
 
@@ -276,55 +361,52 @@ def insensitive_glob(pattern):
         Returns
         -------
 
-        dictionary : A1FILES,A2FILES.weighting
+        dictionary : A1FILES,A2FILES
 
         where:
 
         A1FILES  : data files
         A2FILES  : QA files
-        weighting: focus
 
         """
-        if(self.a1Files==None):
-            product = self.product
-            tile = self.tile
-            version = self.version
-            srcdir = self.srcdir
-            doy = '%03d'%int(doy)
-            self.a1Files = []
-            self.a2Files = []
-            self.weighting = []
-            for i,year in enumerate(yearList):
+        product = self.product
+        tile = self.tile
+        version = self.version
+        srcdir = self.srcdir
+        doy = '%03d'%int(doy)
+        a1Files = []
+        a2Files = []
+        for i,year in enumerate(yearList):
                 year = str(yearList[i])
-                # Lewis modified for different structure
+                # look in e.g. srcdir + '/MCD43A2/2000/h18v03/*/*MCD432.A2000000.h18v03.005.*.hdf'
                 a2 = insensitive_glob(srcdir+'/%s2/%s/%s/*/'%(product,year,tile)+\
                          '*'+product+'2.A'+year+str(doy)+'.'+tile+'.'+version+'.*.hdf')
                 a1 = insensitive_glob(srcdir+'/%s1/%s/%s/*/'%(product,year,tile)+\
                          '*'+product+'1.A'+year+str(doy)+'.'+tile+'.'+version+'.*.hdf')
-
+ 
+                # look in eg srcdir + '/*MCD43A1.A2000000.h18v03.005.*.hdf'
                 if len(a1) == 0 or len(a2) == 0: 
                   a2 = insensitive_glob(srcdir+'/'+'*'+product+'2.A'+year+str(doy)+'.'+tile+'.'+version+'.*.hdf')
                   a1 = insensitive_glob(srcdir+'/'+'*'+product+'1.A'+year+str(doy)+'.'+tile+'.'+version+'.*.hdf')
-
+              
+                # look in eg '/*MCD43A2/2000/*.A2000000.h18v03.*hdf'
                 if len(a2) == 0 or len(a1) == 0:
                   a2.extend(insensitive_glob(self.srcdir+'/'+'*'+self.product+'2/%s/*.A%s%s.%s.*hdf'%(year,year,str(doy),self.tile)))
                   a1.extend(insensitive_glob(self.srcdir+'/'+'*'+self.product+'1/%s/*.A%s%s.%s.*hdf'%(year,year,str(doy),self.tile)))
 
-
                 if len(a1) == 0 or len(a2) == 0 :
-                    logging.info( '========',extra=self.d)
-                    logging.info( 'inconsistent or missing data for doy \
+                    self.logging.info( '========',extra=self.d)
+                    self.logging.info( 'inconsistent or missing data for doy \
                               %s year %s tile %s version %s'%(str(doy),str(year),tile,version),extra=self.d)
-                    logging.info( 'A1: %s'%a1,extra=self.d)
-                    logging.info( 'A2: %s'%a2,extra=self.d)
-                    logging.info( '========',extra=self.d)
+                    self.logging.info( 'A1: %s'%a1,extra=self.d)
+                    self.logging.info( 'A2: %s'%a2,extra=self.d)
+                    self.logging.info( '========',extra=self.d)
                 else:
-                    self.a1Files.append(a1[0])
-                    self.a2Files.append(a2[0])
-                    self.weighting.append(self.focus[i])
-                    logging.info( a1[0],extra=self.d)
+                    a1Files.append(a1[0])
+                    a2Files.append(a2[0])
+                    self.logging.info( a1[0],extra=self.d)
        
-        return self.a1Files,self.a2Files,self.weighting
+        return a1Files,a2Files
 
 
     def sortDims(self,ip,op):
@@ -375,9 +457,9 @@ def insensitive_glob(pattern):
 
         return op
 
-
-
-    def getModisAlbedo(self,fileName,QaFile,sdim,backupscale):
+    def getModisAlbedo(self,fileName,QaFile,bands=[0,1,2,3,4,5,6],\
+                        snow=False,no_snow=True,dataw=None,\
+                        sdim=[-1,-1,-1,-1],backupscale=0.61803398875):
         """
         Extract data from MODIS data file (C5)
 
@@ -388,36 +470,34 @@ def insensitive_glob(pattern):
                       The HDF filename containing the required data (e.g. MCD43A1.A2008001.h19v08.005.2008020042141.hdf)
         QaFile      : MCD43 QA file (A2)  
                       The HDF filename for the associated QA datafile(e.g. MCD43A2.A2008001.h19v08.005.2008020042141.hdf)
+
+        Optional:
+
+        snow        : process snow pixels
+        no_snow     : process no_snow pixels
+        bands       : array e.g. [0,1,2,3,4,5,6]
         sdim        : array [-1,-1,-1,-1] used to ectract subset / subsample. 
                       The format is [s0,ns,l0,nl]
-        backupscale : translation coefficients for QA flags
-                      e.g. [1.,0.7,0.49,0.3]
+        backupscale : translation quantity for QA flags
+                      e.g. 0.61803398875
  
         Returns
         -------
 
         dictionary : containing
 
-        err      : long              
-                   error code (set to 1 if file error on qa data and ERRCODE also set as string
-        nSnow    : long              
-                   number of snow samples found
-        isSnow   : long[ns,nl]       
-                   spatial flag for snow (1), no snow (0), no data (-1)
-        n        : float[ns,nl]     
-                   spatial flag for weighted number fo samples (according to backupscale)
-        data : float[nb,3,ns,nl] 
-                   extracted dataset of model parameters
-        nb       : long              
-                   number of bands
-        ns       : long             
-                   number of samples
-        nl       : long              
-                   number of lines
-        land     : long[ns,nl]       
-                   land category (15 = do not process)
+        weight    : weight[ns,nl]
+        data:     : data[nb,ns,nl,3]
+        mask:     : mask[ns,nl]                 : True for good data
+        snow_mask : snow_mask[ns,nl]    : True for snow
+        land      : land[ns,nl]         : 1 for land and only land
 
-        Notes
+        error    : bool              
+        nb       : long    : number of bands
+        ns       : long    : number of samples
+        nl       : long    : number of lines
+
+        Notes for land
         -----
         0  :    Shallow ocean
         1  :   Land (Nothing else but land)
@@ -431,138 +511,127 @@ def insensitive_glob(pattern):
         see https://lpdaac.usgs.gov/products/modis_products_table/mcd43a2
                                     
         """
-        bands = self.bands
-
         duff = long(32767)
         oneScale = 1000
         scale = 1.0/oneScale
-        nBands = len(self.bands)
-        mask = 3
-        #get the data size
-        logging.info( '...reading qa... %s'%QaFile,extra=self.d)
-
+        nBands = len(bands)
         err=0
-        openQA=0;
         try:
+          if dataw == None:
+            try:
+              self.logging.info( '...reading qa... %s'%QaFile,extra=self.d)
+            except:
+              pass
+            # open the QA file
             hdf = SD.SD(QaFile)
-            openQA=1
             sds_1 = hdf.select(0)
             nl,ns = sds_1.dimensions().values()
             fileDims = [0,ns,0,nl]
             #take a subset if input sdims values require it
             s0,ns,l0,nl = self.sortDims(sdim,fileDims)
-            #get the data
-            QA = sds_1.get(start=[s0,l0],count=[ns,nl])
-    
+  
+            # BRDF_Albedo_Quality: 255 is a Fill
+            goodData = np.array(sds_1.get(start=[s0,l0],count=[ns,nl])) != 255
+  
+            # Snow_BRDF_Albedo 
             sds_2 = hdf.select(1)
-            QA2 = sds_2.get(start=[s0,l0],count=[ns,nl])
-    
+            QA = np.array(sds_2.get(start=[s0,l0],count=[ns,nl]))
+            # snow mask is True for snow and False for no snow
+            goodData = goodData & (QA!=255)
+            snow_mask    = QA==1
+            no_snow_mask = QA==0
+            #  BRDF_Albedo_Ancillary
+            #  pull land / sea etc mask 
             sds_3 = hdf.select(2)
-            QA3 = sds_3.get(start=[s0,l0],count=[ns,nl])
-    
-            sds_4 = hdf.select(3)
-            QA4 = sds_4.get(start=[s0,l0],count=[ns,nl])
-            
-            hdf.end()
-    
-            logging.info( 'done ...reading data...',extra=self.d)
-            data = []
-            goodData = np.ones((ns,nl),dtype=np.int8)
-            typeOfInversion = np.zeros((ns,nl),dtype=np.dtype('f4')) - 1.0
-            typeOfSnow = np.zeros((ns,nl),dtype=np.int8) - 1
-       
-            hdf = SD.SD(fileName)
-            
-            for i in range(nBands):
-                logging.info( '  ... band %d'%i,extra=self.d)
-                # Lewis: ensure this is an int
-                sds = hdf.select(int(bands[i]))  
-                ithis = sds.get(start=[s0,l0,0],count=[ns,nl,3])
-                #filter out duff values
-                for j in range(3):
-                    badValues = np.where(ithis[:,:,j] == duff)
-                    goodData[badValues] = 0
-                    
-                data.append(ithis.astype(np.float32))
+            QA = np.array(sds_3.get(start=[s0,l0],count=[ns,nl]))
+            # land / water is bits 4-7
+            land = (( 0b11110000 & QA ) >> 4).astype(np.uint8)
+            # dont want deep ocean
+            goodData = goodData & (land != 7)
 
-            for i in range(nBands):
-                data[i][goodData==0] = 0.
+            #  BRDF_Albedo_Band_Quality 
+            sds_4 = hdf.select(3)
+            QA = np.array(sds_4.get(start=[s0,l0],count=[ns,nl]))
+            band_quality = QA & 0b1111
+            QA = QA >> 4
+            goodData = goodData & (band_quality < 4)
+            #this loop might not be needed ...
+            #might get away with just teh first band ...
+            #for k in range(1,1):
+            band_quality2 = QA & 0b1111
+            goodData = goodData & (band_quality2 < 4)
+            QA = QA >> 4
+            # take the max
+            w = band_quality2>band_quality
+            band_quality[w] = band_quality2[w]
             hdf.end()
-            
-            logging.info( 'done ...sorting mask...',extra=self.d)
-            #get the land mask (taking only 'Land (Nothing else but land)')
-            land = (QA3 >> 4 & 15) & (goodData == 1)
-            w = np.where(land != 1)
-            land[w] = 0
-            bandqa = QA4 & mask
-    
-            for k in range(1,7):
-                QA4 = QA4/16
-                bandqb = QA4 & mask
-                w=np.where(bandqb > bandqa)
-                bandqa[w] = bandqb[w]
-    
-            """     
-            set wanted data to 1
-            QA == 0 --> 'full inversion'
-            QA == 1 --> 'mag inversion'
-            QA2 ==0 --> 'no snow'
-            QA2 ==1 --> 'snow'
-            sort the QA info to assign a weight (specified by backupscale)
-            for 0 : best quality, full inversion (WoDs, RMSE majority good)
-            1 : good quality, full inversion 
-            2 : Magnitude inversion (numobs >=7) 
-            3 : Magnitude inversion (numobs >=3&<7) 
-            where the QA is determined as the maximum (ie poorest quality) over the wavebands  
-            """  
-            if len(backupscale) == 2:
-                bandqa = QA
-            for i in range(len(backupscale)):
-                if backupscale[i] != 0.0:
-                    # VERSION 2: only take land 1
-                    w = np.where((bandqa == i) & (land == 1) & (goodData == 1))                
-                    typeOfInversion[w] = backupscale[i]
-                    logging.info( 'weight: %.3f %d'%(backupscale[i],len(w[0])),extra=self.d)
-                else:
-                    logging.info( 'weight: %.3f %d'%(backupscale[i],0),extra=self.d)
-    
-    
-            w = np.where((QA2 == 1) & (typeOfInversion > 0))
-            typeOfSnow[w] = 1
-            nSnow = len(w[0])
-        
-    
-            w = np.where((QA2 == 0) & (typeOfInversion > 0))
-            typeOfSnow[w] = 0
-    
-            w = np.where(typeOfInversion < 0)
-            typeOfInversion[w] = 0.0
-            N = typeOfInversion
-    
-            logging.info('done',extra=self.d)
-        
+          else:
+            s0,ns,l0,nl = dataw['limits']
+            mask = QA = goodData = dataw['mask']
+            land = dataw['land']
+            weight = dataw['weight']
+            snow_mask = dataw['snow_mask']
+
+          self.logging.info( 'reading data... %s'%fileName,extra=self.d)
+
+          # open the data file 
+
+          hdf = SD.SD(fileName)
+          # allocate array for all bands
+          data = np.zeros((3, nBands) + QA.shape)
+          # loop over bands 
+          for i in range(nBands):
+            self.logging.info( '  ... band %d'%int(bands[i]),extra=self.d)
+            # Lewis: ensure this is an int
+            sds = hdf.select(int(bands[i]))
+            ithis = np.array(sds.get(start=[s0,l0,0],count=[ns,nl,3]))
+            #filter out duff values
+            for j in range(3):
+              goodData = goodData & (ithis[:,:,j] != duff)
+              data[j,i] = scale * ithis[:,:,j]
+          hdf.end()
+
+          #self.logging.info( 'done ...',extra=self.d)
+          """     
+          sort the QA info to assign a weight (specified by backupscale)
+          for 0 : best quality, full inversion (WoDs, RMSE majority good)
+          1 : good quality, full inversion 
+          2 : Magnitude inversion (numobs >=7) 
+          3 : Magnitude inversion (numobs >=3&<7) 
+          where the QA is determined as the maximum (ie poorest quality) over the wavebands  
+          """
+
+          if dataw == None:
+            # snow type filtering
+            if snow and no_snow:
+              pass
+            elif snow:
+              goodData = goodData & snow_mask
+            elif no_snow:
+              goodData = goodData & no_snow_mask
+
+            weight = backupscale ** band_quality
+  
+            self.logging.info( ' ...sorting mask...',extra=self.d)
+            mask = goodData
+            land      = land * mask
+            weight    = weight * mask
+            snow_mask = snow_mask * mask
+            no_snow_mask = no_snow_mask * mask
+            # NB this changes the data set shape around
+            # so its data[0-3,nb,:,:]
+          data = data * mask
+
+          retval = {'error':False,'ns':ns,'nl':nl,'nb':nBands,\
+                        'land':land,'weight':weight,\
+                        'limits':(s0,ns,l0,nl),'no_snow_mask':no_snow_mask,\
+                        'data':data,'mask':goodData,'snow_mask':snow_mask}
+          self.logging.info('done',extra=self.d)
         except:
-            fileErr = None
-            
-            if(openQA==1):
-                filenameTab=fileName.replace("\\", "/").split("/");
-                filename=filenameTab[len(filenameTab)-1]
-                fileErr = open(self.errFiles + '/' + 'errFile.'+filename, 'w')
-            else:
-                filenameTab=QaFile.replace("\\", "/").split("/");
-                filename=filenameTab[len(filenameTab)-1]
-                fileErr = open(self.errFiles + '/' + 'errFile.'+filename, 'w')
-            
-            fileErr.close();
-            
-            logging.warning( 'error in %s'%fileName,extra=self.d)
-            err=1
-             
-        if err==0:
-            return dict(err=err, nSnow=nSnow, isSnow=typeOfSnow, N=N, data=np.asarray(data)*scale, nb=nBands, ns=ns, nl=nl, land=land)
-        else:
-            return dict(err=err, nSnow=None, isSnow=None, N=None, data=None, nb=None, ns=None, nl=None, land=None)
-        
+          retval = {'error':True}
+        return retval
+
+
 
     def allocateData(self,nb,ns,nl,nsets,flag):
         """
@@ -602,7 +671,7 @@ def insensitive_glob(pattern):
             data = np.zeros((nsets,nb,ns,nl,3),dtype=np.float32)           
             n = np.zeros((nsets,nb,ns,nl,3),dtype=np.float32)
             nSamples = np.zeros((nsets,nb,ns,nl),dtype=np.int)
-            logging.info( 'numb of bands %d, numb of samples %d, numb of lines %d'%(nb, ns, nl),extra=self.d)
+            self.logging.info( 'numb of bands %d, numb of samples %d, numb of lines %d'%(nb, ns, nl),extra=self.d)
  
         else:
             data = -1
@@ -669,15 +738,15 @@ def insensitive_glob(pattern):
         # find where == 0  as f0 == 0 is likely dodgy     
         w = np.where((f0sum<=0) & (samplesN>0))
         if len(w)>0 and len(w[0])>0:
-          logging.info('N %.2f'%samplesN.sum(),extra=self.d)
-          logging.info("deleting %d samples that are zero"%len(w[0]),extra=self.d)
+          self.logging.info('N %.2f'%samplesN.sum(),extra=self.d)
+          self.logging.info("deleting %d samples that are zero"%len(w[0]),extra=self.d)
           samplesN[w] = 0
-          logging.info('N %.2f'%samplesN.sum(),extra=self.d)
+          self.ogging.info('N %.2f'%samplesN.sum(),extra=self.d)
         else:
-          logging.info('N %.2f'%samplesN.sum(),extra=self.d)
+          self.logging.info('N %.2f'%samplesN.sum(),extra=self.d)
         # save some time on duffers
         if samplesN.sum() == 0:
-          logging.info('No samples here ...',extra=self.d)
+          self.logging.info('No samples here ...',extra=self.d)
           return sumData
 
         weight = np.zeros((nb,ns,nl,3),dtype=np.float32)
@@ -771,14 +840,13 @@ def insensitive_glob(pattern):
                        
 
         """
-self.backupscale = self.ip.backupscale
         self.a1Files = None
         self.a2Files = None
-        a1Files, a2Files, weighting = self.getValidFiles(yearList,doy[0])
+        a1Files, a2Files = self.getValidFiles(yearList,doy[0])
 
-        logging.info('doy %s'%str(doy[0]),extra=self.d)
+        self.logging.info('doy %s'%str(doy[0]),extra=self.d)
         for i in xrange(len(a1Files)):
-           logging.info('  %d %s %s'%(i,str(a1Files[i]),str(a2Files[i])),extra=self.d)
+           self.logging.info('  %d %s %s'%(i,str(a1Files[i]),str(a2Files[i])),extra=self.d)
 
         foundOne = False
         thisOne = 0
@@ -788,10 +856,10 @@ self.backupscale = self.ip.backupscale
                           sdmins,np.asarray(self.backupscale)*weighting[thisOne])
           if thisData['err'] != 0:
             thisOne += 1
-            logging.warning('error in getModisAlbedo for %s %s'%(a1Files[thisOne],a2Files[thisOne]),extra=self.d)
+            self.logging.warning('error in getModisAlbedo for %s %s'%(a1Files[thisOne],a2Files[thisOne]),extra=self.d)
             # try another one?
             if thisOne == len(a1Files):
-              logging.error('error in getModisAlbedo: No valid data files found')
+              self.logging.error('error in getModisAlbedo: No valid data files found')
               thisData['err'] = 1
               return False,0,0,0,0,nb, ns, nl, 0
           else:
@@ -802,14 +870,14 @@ self.backupscale = self.ip.backupscale
         nb = thisData['nb']
         totalSnow = 0
         #set up arrays for sum, n and sum2
-        logging.info('data allocation',extra=self.d)
+        self.logging.info('data allocation',extra=self.d)
         dontsnow = self.ip.dontsnow
         dontnosnow = self.ip.dontnosnow 
         dontwithsnow = self.ip.dontwithsnow 
  
         nsets = len(a1Files)
         if nsets == 0:
-          logging.error('error in file specification: zero length list of files a1Files',extra=self.d)
+          self.logging.error('error in file specification: zero length list of files a1Files',extra=self.d)
           thisData['err'] = 1
           return False,0,0,0,0,nb, ns, nl, 0
 
@@ -818,29 +886,29 @@ self.backupscale = self.ip.backupscale
           sumDataNoSnow = self.allocateData(nb,ns/self.ip.shrink,nl/self.ip.shrink,nsets,dontnosnow)
           sumDataWithSnow = self.allocateData(nb,ns/self.ip.shrink,nl/self.ip.shrink,nsets,dontwithsnow)
         except:
-          logging.error('error in memory allocation: nb %d ns %d nl %d nsets %s'%(nb,ns/self.ip.shrink,nl/self.ip.shrink,nsets),extra=self.d)
+          self.logging.error('error in memory allocation: nb %d ns %d nl %d nsets %s'%(nb,ns/self.ip.shrink,nl/self.ip.shrink,nsets),extra=self.d)
           return False,0,0,0,0,nb, ns, nl, 0 
 
         land = np.zeros((ns,nl),dtype='bool') 
  
         if dontsnow == 0 or dontwithsnow == 0:
             totalSnow = thisData['nSnow']
-            logging.info('n snow %d'%totalSnow,extra=self.d)
+            self.logging.info('n snow %d'%totalSnow,extra=self.d)
 
         for i in range(len(a1Files)):
-            logging.info( 'file %d/%d'%(i,len(a1Files)),extra=self.d)
-            logging.info( 'doy %s %s'%(str(doy[0]),str(a1Files[i])),extra=self.d)
+            self.logging.info( 'file %d/%d'%(i,len(a1Files)),extra=self.d)
+            self.logging.info( 'doy %s %s'%(str(doy[0]),str(a1Files[i])),extra=self.d)
             #only read if i > 1 as we have read first file above
             if (i != thisOne):
                 thisData = self.getModisAlbedo(a1Files[i],a2Files[i],sdmins,\
                                      np.asarray(self.ip.backupscale)*weighting[i])
             if (thisData['err'] != 0):
-                logging.warning( 'warning opening file: %s'%str(a1Files[i]),extra=self.d)
+                self.logging.warning( 'warning opening file: %s'%str(a1Files[i]),extra=self.d)
             else:
                 # Lewis: sort the land info
                 land = (land | (thisData['land'] == 1))
                 
-                logging.info( '... incrementing samples',extra=self.d)
+                self.logging.info( '... incrementing samples',extra=self.d)
                 if (dontsnow == 0):
                     sumDataSnow = self.incrementSamples(sumDataSnow,thisData,1,i)
                 if (dontnosnow == 0):
@@ -849,7 +917,7 @@ self.backupscale = self.ip.backupscale
                     sumDataWithSnow = self.incrementSamples(sumDataWithSnow,thisData,2,i)
                 if (dontsnow == 0 or dontwithsnow == 0):
                     totalSnow += thisData['nSnow']
-                logging.info( 'done',extra=self.d)
+                #self.logging.info( 'done',extra=self.d)
         
     
         return True,totalSnow, sumDataNoSnow, sumDataSnow, sumDataWithSnow, nb, ns, nl, land
@@ -881,11 +949,11 @@ self.backupscale = self.ip.backupscale
 
         """
         focus = np.array(self.weighting)
-        logging.info("sorting data arrays ...",extra=self.d)
+        self.logging.info("sorting data arrays ...",extra=self.d)
         n = sumData['n']
         data = sumData['data']
         nSamples = sumData['nSamples']
-        logging.info("...done",extra=self.d)
+        #self.logging.info("...done",extra=self.d)
 
         sumN = np.sum(nSamples,axis=0)
         ww = np.where(sumN>0)
@@ -1011,420 +1079,6 @@ self.backupscale = self.ip.backupscale
 
         return odata
 
-    def writeRST(self,ns,nl,nb,mean,sd,n,land,snowType,p,doy,shrink=None,order=0):
-        """
-        Write relevant images and stats to an rst file (for further processing with sphinx)
-
-        Parameters
-        -----------
-        ns : integer
-             number of samples
-        nl : integer
-             number of lines 
-        nb : integer
-             number of bands
-        mean : float array 
-               containing mean data
-        sd : float array 
-               containing std dev data
-        n  : float array 
-               containing sample weight data
-        land : float array 
-               containing land / sea mask
-        snowType : string 
-                e.g. SnowAndNoSnow, used in the output filenames
-        p : integer 
-            index for part (0 default)
-        doy : string
-            DOY string e.g. 001
-
-        Options
-        --------
-
-        shrink : integer
-                 shrink factor applied
-        order : integer
-                 Specify a variation in the array ordering of `mean` and `sd`.
-                 If `order` is 0, we have ``mean[band,sample,line,kernel_number]``
-                 , otherwise it is ``mean[band*3+kernel_number,sample,line]``      
-
-        Notes
-        -----
-
-        The filenames for graphs are derived from:
-
-        filename =  'Kernels_' + doy + '_' + self.ip.version + '_' + self.ip.tile + '_' 
-                                                        + snowType +'_'+ p + 'XXXX.png'
-
-        And the ReST file:
-
-        rstFile = self.ip.rstdir + '/Kernels_' + doy + '_' + self.ip.version + '_' + 
-                                  self.ip.tile + '_' + snowType +'_'+ p + 'XXXX.rst'
-
-        """
-        import pylab as plt
-
-        p = '%02d'%p
-        shrink = shrink or self.ip.shrink
-        doy = '%03d'%int(doy)
-
-
-        kernels = self.ip.basename or Kernels
-        filename = '%s_'%kernels + doy + '_' + self.ip.version + '_' +\
-                                 self.ip.tile + '_' + snowType +'_'+ p + 'XXXX.png'
-        rstFile = self.ip.rstdir + '/%s_'%kernels + doy + '_' + self.ip.version + '_' +\
-                                 self.ip.tile + '_' + snowType +'_'+ p + 'XXXX.rst'
-
-        try:
-          f0 = open(rstFile.replace('XXXX','F0'),'w')
-          f1 = open(rstFile.replace('XXXX','F1'),'w')
-          f2 = open(rstFile.replace('XXXX','F2'),'w')
-        except:
-          logging.info( 'rst write failure: %s'%rstFile,extra=self.d)
-          return
-
-
-        header = '''
-Stage 1 processing
-====================
-
-Stage 1 prior processing for DOY %s\n
-        
-MODIS version: %s
-        
-Tile: %s
-
-Snow processing: %s
-
-Process part: %s
-
-Generated with:
-
-.. code-block:: csh
-
-  %s
-
-        '''%(doy,self.ip.version,self.ip.tile,snowType,p,''.join( [i.replace('[',"'[").replace(']',"]'") + ' ' for i in sys.argv]))
-        bNames = self.idSamples(nb)
-        bNames.append('Weighted number of samples')
-        bNames.append('land mask')
-
-        logging.info( 'writing %s'%filename,extra=self.d)
-        if nb == 2:
-            defBands = [4,1,1]
-        else:
-            defBands = [1,10,7]
-        descrip = snowType + ' MODIS Mean/SD ' + doy + ' over the years ' + str(self.yearList)  + \
-            ' version ' + self.ip.version + ' tile '+ self.ip.tile + \
-            ' using input MODIS bands '
-        for band in self.ip.bands:
-            descrip = descrip + str(band) + ' '
-
-        for f in [f0,f1,f2]:
-          f.write(header + '\n')
-          f.write('`Log file <%s>`_\n\n\n'%self.log)
-          f.write(descrip + '\n')
-
-        fs = [f0,f1,f2]
-        try:
-          count = self.count
-        except:
-          count = 0
-
-        #shrunkLand = self.shrunk(land,ns,nl,shrink)
-        shrunkLand = land
-        fig = plt.figure(count);plt.clf()
-        ax = fig.add_subplot(111)
-        im=ax.imshow(shrunkLand,interpolation='nearest');
-        ax.set_aspect('equal')
-        fn = filename.replace('XXXX',"LandMask_%s"%self.id)
-        fig.savefig( self.ip.rstdir + '/' + fn)
-        count += 1
-
-        for f in [f0,f1,f2]:
-          f.write("\n\n.. image:: %s\n\n\n\nLand mask\n"%fn)
-          f.write("\n\nNumber of land pixels: %d\nProportion of land pixels:%.3f\n\n"%(np.sum(shrunkLand),np.mean(shrunkLand)))
-
-          f.write("\n\n\nMean and SD results\n--------------------------\n")
-
-        if order == 0:
-          shrunkN = n[0,:,:,0]
-          #shrunkN = self.shrunk(n[0,:,:,0],ns,nl,shrink)
-        else:
-          shrunkN = n[:,:]
-          #shrunkN = self.shrunk(n[:,:],ns,nl,shrink)
-
-        for i in range(nb):
-            for j in range(3):
-                if order == 0:
-                  shrunkMean = mean[i,:,:,j]
-                  shrunkSd = sd[i,:,:,j]
-                  #shrunkMean,shrunkSd = self.shrunk(mean[i,:,:,j],ns,nl,shrink,sdata=sd[i,:,:,j])
-                else:
-                  shrunkMean = mean[i*3+j,:,:]
-                  shrunkSd = sd[i*3+j,:,:]
-                  #shrunkMean,shrunkSd = self.shrunk(mean[i*3+j,:,:],ns,nl,shrink,sdata=sd[i*3+j,:,:])
-
-                fig = plt.figure(count);plt.clf()
-                ax = fig.add_subplot(111)
-                im=ax.imshow(self.fix(shrunkMean),interpolation='nearest');fig.colorbar(im)
-                ax.set_aspect('equal')
-                fn = filename.replace('XXXX',"Mean_band_%03d_F%d_%s"%(i,j,self.id))
-                fig.savefig( self.ip.rstdir + '/' + fn)
-                fs[j].write("\n\n.. image:: %s\n\n\n\n%s\n"%(fn,'mean: band %03d F%d'%(i,j)))
-                count += 1
-                # histogram stackoverflow.com/questions/5328556/histogram-matplotlib
-                data = shrunkMean[shrunkMean>0]
-                try:
-                  hist,bins = np.histogram(self.fix(data),bins=50)
-                  width = 0.7*(bins[1]-bins[0])
-                  center = (bins[:-1]+bins[1:])/2
-                  plt.figure(count);plt.clf()
-                  plt.bar(center,hist,align='center',width=width)
-                  fn = filename.replace('XXXX',"hist_Mean_band_%03d_F%d"%(i,j))
-                  plt.savefig( self.ip.rstdir + '/' + fn)
-                  fs[j].write("\n\n.. image:: %s\n\n\n\n%s\n"%(fn,'mean: band %03d F%d'%(i,j)))
-                  fs[j].write("\n\nMean: %.3f Median: %.3f Min: %.3f Max: %.3f SD: %.3f\n"\
-                             %(np.mean(data),np.median(data),np.min(data),np.max(data),stats.sem(data,axis=None,ddof=1)))
-                except:
-                  if len(data) == 0:
-                    data = [0.]
-                  fs[j].write("\n\nMean: %.3f Median: %.3f Min: %.3f Max: %.3f SD: %.3f\n"\
-                             %(np.mean(data),np.median(data),np.min(data),np.max(data),stats.sem(data,axis=None,ddof=1)))
-                  logging.warning('failed to create mean histogram',extra=self.d)
-                count += 1
-
-                # STD DEV
-                fig = plt.figure(count);plt.clf()
-                ax = fig.add_subplot(111)
-                im=ax.imshow(self.fix(shrunkSd),interpolation='nearest');fig.colorbar(im)
-                ax.set_aspect('equal')
-                fn = filename.replace('XXXX',"SD_band_%03d_F%d_%s"%(i,j,self.id))
-                fig.savefig( self.ip.rstdir + '/' + fn)
-                fs[j].write("\n\n.. image:: %s\n\n\n\n%s\n"%(fn,'sd: band %03d F%d'%(i,j)))
-                count += 1
-                # histogram stackoverflow.com/questions/5328556/histogram-matplotlib
-                data = shrunkSd[shrunkSd>0]
-                try:
-                  hist,bins = np.histogram(self.fix(data),bins=50)
-                  width = 0.7*(bins[1]-bins[0])
-                  center = (bins[:-1]+bins[1:])/2
-                  plt.figure(count);plt.clf()
-                  plt.bar(center,hist,align='center',width=width)
-                  fn = filename.replace('XXXX',"hist_SD_band_%03d_F%d"%(i,j))
-                  plt.savefig( self.ip.rstdir + '/' + fn)
-                  fs[j].write("\n\n.. image:: %s\n\n\n\n%s\n"%(fn,'sd: band %03d F%d'%(i,j)))
-                  fs[j].write("\n\nMean: %.3f Median: %.3f Min: %.3f Max: %.3f SD: %.3f\n"\
-                             %(np.mean(data),np.median(data),np.min(data),np.max(data),stats.sem(data,axis=None,ddof=1)))
-                except:
-                  if len(data) == 0:
-                    data = [0.]
-                    fs[j].write("\n\nMean: %.3f Median: %.3f Min: %.3f Max: %.3f SD: %.3f\n"\
-                             %(np.mean(data),np.median(data),np.min(data),np.max(data),stats.sem(data,axis=None,ddof=1)))
-                  logging.warning('failed to create sd histogram',extra=self.d)
-                count += 1
-
-                # coefficient of variation
-                fig = plt.figure(count);plt.clf()
-                ax = fig.add_subplot(111)
-                cv = np.zeros_like(shrunkSd)
-                w = np.where(shrunkMean>0)
-                cv[w] = shrunkSd[w]/shrunkMean[w]
-                im=ax.imshow(self.fix(cv),interpolation='nearest');fig.colorbar(im)
-                ax.set_aspect('equal')
-                fn = filename.replace('XXXX',"CV_band_%03d_F%d_%s"%(i,j,self.id))
-                fig.savefig( self.ip.rstdir + '/' + fn)
-                fs[j].write("\n\n.. image:: %s\n\n\n\n%s\n"%(fn,'cv: band %03d F%d'%(i,j)))
-                count += 1
-                # histogram stackoverflow.com/questions/5328556/histogram-matplotlib
-                data = cv[cv>0]
-                try:
-                  hist,bins = np.histogram(self.fix(data),bins=50)
-                  width = 0.7*(bins[1]-bins[0])
-                  center = (bins[:-1]+bins[1:])/2
-                  plt.figure(count);plt.clf()
-                  plt.bar(center,hist,align='center',width=width)
-                  fn = filename.replace('XXXX',"hist_CV_band_%03d_F%d"%(i,j))
-                  plt.savefig( self.ip.rstdir + '/' + fn)
-                  fs[j].write("\n\n.. image:: %s\n\n\n\n%s\n"%(fn,'cv: band %03d F%d'%(i,j)))
-                  fs[j].write("\n\nMean: %.3f Median: %.3f Min: %.3f Max: %.3f SD: %.3f\n"\
-                             %(np.mean(data),np.median(data),np.min(data),np.max(data),stats.sem(data,axis=None,ddof=1)))
-                except:
-                  if len(data) == 0:
-                    data = [0.]
-                    fs[j].write("\n\nMean: %.3f Median: %.3f Min: %.3f Max: %.3f SD: %.3f\n"\
-                             %(np.mean(data),np.median(data),np.min(data),np.max(data),stats.sem(data,axis=None,ddof=1)))
-                  logging.warning('failed to create cv histogram',extra=self.d)
-                count += 1
-
-                '''
-                # normalise uncertainty
-                fig = plt.figure(count);plt.clf()
-                ax = fig.add_subplot(111)
-                nsd = np.zeros_like(shrunkSd)
-                nYears = len(self.yearList)
-                # The idea here is that if we had nYears samples
-                # each with std dev S, then we would expect std dev to be S/sqrt(nYears)
-                # in fact, we have shrunkN samples, so we might consider
-                # raising the std dev by a factor sqrt(nYears/shrunkN)
-                w1 = np.where((shrunkN>0) & (shrunkSd <= np.sqrt(self.minvar)*1000))
-                w = np.where(shrunkN>0)
-                nChange = np.array(w1).shape[1]
-                nsd[w] = np.sqrt(float(nYears)/shrunkN[w])*shrunkSd[w]
-                # set nominally low values to the median
-                if len(w[0]) == 0:
-                  median = np.sqrt(self.maxvar)
-                else:
-                  median = np.median(nsd[w])
-                  median = np.median(nsd[w][nsd[w]>median])
-                if np.isnan(median):
-                  median = 1.0
-                if median == 0:
-                  median = np.sqrt(self.maxvar)
-                if nChange > 0:
-                  logging.info("  %d %d Modifying %d low threshold std err to upper quartile (%.2f)"%(i,j,nChange,median),extra=self.d) 
-                nsd[w1] = median
-                # deal with low sample number terms
-                w1 = np.where((shrunkN<2)&(shrunkN>0)&(nsd<median))
-                nChange = np.array(w1).shape[1]
-                if nChange > 0:
-                  logging.info("  %d %d Modifying %d low sample number entries to upper quartile (%.2f)"%(i,j,nChange,median),extra=self.d)
-                nsd[w1] = median
-                nsd[nsd>np.sqrt(self.maxvar)] = np.sqrt(self.maxvar)
-                im=ax.imshow(self.fix(nsd),interpolation='nearest');fig.colorbar(im)
-                ax.set_aspect('equal')
-                fn = filename.replace('XXXX',"NSD_band_%03d_F%d_%s"%(i,j,self.id))
-                fig.savefig( self.ip.rstdir + '/' + fn)
-                fs[j].write("\n\n.. image:: %s\n\n\n\n%s\n"%(fn,'normalised std dev: band %03d F%d'%(i,j)))
-                fs[j].write("\n\nThe normalisation is a scaling of std dev by sqrt(Nyears/Nsamples) where \
-                            Nyears = %d here (threshold at %.2f)\n\n\n"%(nYears,self.maxvar))
-                count += 1
-                # histogram stackoverflow.com/questions/5328556/histogram-matplotlib
-                data = nsd[nsd>0]
-                try:
-                  hist,bins = np.histogram(self.fix(data),bins=50)
-                  width = 0.7*(bins[1]-bins[0])
-                  center = (bins[:-1]+bins[1:])/2
-                  plt.figure(count);plt.clf()
-                  plt.bar(center,hist,align='center',width=width)
-                  fn = filename.replace('XXXX',"hist_NSD_band_%03d_F%d"%(i,j))
-                  plt.savefig( self.ip.rstdir + '/' + fn)
-                  fs[j].write("\n\n.. image:: %s\n\n\n\n%s\n"%(fn,'nsd: band %03d F%d'%(i,j)))
-                  fs[j].write("\n\nMean: %.3f Median: %.3f Min: %.3f Max: %.3f SD: %.3f\n"\
-                             %(np.mean(data),np.median(data),np.min(data),np.max(data),stats.sem(data,axis=None,ddof=1)))
-                except:
-                  if len(data) == 0:
-                    data = [0.]
-                    fs[j].write("\n\nMean: %.3f Median: %.3f Min: %.3f Max: %.3f SD: %.3f\n"\
-                             %(np.mean(data),np.median(data),np.min(data),np.max(data),stats.sem(data,axis=None,ddof=1)))
-                  logging.warning('failed to create nsd histogram',extra=self.d)
-                count += 1
-
-                # normalised coefficient of variation
-                fig = plt.figure(count);plt.clf()
-                ax = fig.add_subplot(111)
-                cv = np.zeros_like(shrunkSd)
-                w = np.where(shrunkMean>0)
-                cv[w] = nsd[w]/shrunkMean[w]
-                im=ax.imshow(self.fix(cv),interpolation='nearest');fig.colorbar(im)
-                ax.set_aspect('equal')
-                fn = filename.replace('XXXX',"NSDCV_band_%03d_F%d_%s"%(i,j,self.id))
-                fig.savefig( self.ip.rstdir + '/' + fn)
-                fs[j].write("\n\n.. image:: %s\n\n\n\n%s\n"%(fn,'cv from normalised std dev: band %03d F%d'%(i,j)))
-                count += 1
-                # histogram stackoverflow.com/questions/5328556/histogram-matplotlib
-                data = cv[cv>0]
-                try:
-                  hist,bins = np.histogram(self.fix(data),bins=50)
-                  width = 0.7*(bins[1]-bins[0])
-                  center = (bins[:-1]+bins[1:])/2
-                  plt.figure(count);plt.clf()
-                  plt.bar(center,hist,align='center',width=width)
-                  fn = filename.replace('XXXX',"hist_NSDCV_band_%03d_F%d"%(i,j))
-                  plt.savefig( self.ip.rstdir + '/' + fn)
-                  fs[j].write("\n\n.. image:: %s\n\n\n\n%s\n"%(fn,'cv from normalised std dev: band %03d F%d'%(i,j)))
-                  fs[j].write("\n\nMean: %.3f Median: %.3f Min: %.3f Max: %.3f SD: %.3f\n"\
-                             %(np.mean(data),np.median(data),np.min(data),np.max(data),stats.sem(data,axis=None,ddof=1)))
-                except:
-                  if len(data) == 0:
-                    data = [0.]
-                    fs[j].write("\n\nMean: %.3f Median: %.3f Min: %.3f Max: %.3f SD: %.3f\n"\
-                             %(np.mean(data),np.median(data),np.min(data),np.max(data),stats.sem(data,axis=None,ddof=1)))
-                  logging.warning('failed to create nsd cv histogram',extra=self.d)
-                count += 1
-                '''
-        for f in fs:
-          f.write("\n\n\nSamples\n-----------------\n")
-
-        fig = plt.figure(count);plt.clf()
-        ax = fig.add_subplot(111)
-        im=ax.imshow(shrunkN,interpolation='nearest');fig.colorbar(im)
-        ax.set_aspect('equal')
-        fn = filename.replace('XXXX',"Nsamp_%s"%self.id)
-        fig.savefig( self.ip.rstdir + '/' + fn)
-        for f in fs:
-          f.write("\n\n.. image:: %s\n    :width: 80%%\n\n\nNumber of samples (weighted)\n"%fn)
-        count += 1
-        # histogram stackoverflow.com/questions/5328556/histogram-matplotlib
-        try:
-          data = shrunkN[shrunkN>0]
-          hist,bins = np.histogram(data,bins=50)
-          width = 0.7*(bins[1]-bins[0])
-          center = (bins[:-1]+bins[1:])/2
-          plt.figure(count);plt.clf()
-          plt.bar(center,hist,align='center',width=width)
-          fn = filename.replace('XXXX',"hist")
-          plt.savefig( self.ip.rstdir + '/' + fn)
-          for f in fs:
-            f.write("\n\n.. image:: %s\n\n\n\n"%(fn))
-            f.write("\n\nMean: %.3f Median: %.3f Min: %.3f Max: %.3f SD: %.3f\n"\
-                            %(np.mean(data),np.median(data),np.min(data),np.max(data),stats.sem(data,axis=None,ddof=1)))
-        except:
-          if len(data) == 0:
-            data = [0.]
-            f.write("\n\nMean: %.3f Median: %.3f Min: %.3f Max: %.3f SD: %.3f\n"\
-                            %(np.mean(data),np.median(data),np.min(data),np.max(data),stats.sem(data,axis=None,ddof=1)))
-          logging.warning('failed to create N histogram',extra=self.d)
-
-        # count incrementer
-        self.count = count + 1
-        
-
-    def fix(self,data):
-        '''
-        Threshold the data at 99th centile for plotting
-        quantising data to 0.001 bins for histogram calculation
-
-        If this fails for any reason, we return the original data
-
-        Parameters
-        -----------
-
-        data : float array
-               Data to be manipulated
-              
-
-        Returns
-        -------
- 
-        data : float array
-               Data having been manipulated
-
- 
-        '''
-        try:
-          (n,b) = np.histogram(data.flatten(),np.arange(0,1,0.001)) 
-          nc = n.cumsum()
-          N = nc[-1]*0.99 
-          w = np.where(nc >= N)[0][0]
-          max = b[w]
-          d = data.copy()
-          d[d>=max]=max
-          return d
-        except:
-          logging.warning('failed to threshold histogram',extra=self.d)
-          return data
-        
     def readNetCdf(self,nb,snowType,p,doy,filename=None):
         """
 
@@ -1464,7 +1118,7 @@ Generated with:
 
         filename = filename or self.ip.opdir + '/Kernels.' + '%03d'%int(doy) + '.' + self.ip.version + '.' +\
                                  self.ip.tile + '.' + snowType +'.'+ p + '.nc'
-        logging.info( 'reading %s'%filename,extra=self.d)
+        self.logging.info( 'reading %s'%filename,extra=self.d)
         try:
           ncfile = nc.Dataset(filename,'r')
         except:
@@ -1473,11 +1127,11 @@ Generated with:
             from subprocess import call
             call(['gzip','-df',filename+'.gz'])
           except:
-             logging.info( "Failed to uncompress output file %s"%filename,extra=self.d)
+             self.logging.info( "Failed to uncompress output file %s"%filename,extra=self.d)
         try:
           ncfile = nc.Dataset(filename,'r')
         except:
-          logging.warning("Failed to read Netcdf file %s"%filename,extra=self.d)
+          self.logging.warning("Failed to read Netcdf file %s"%filename,extra=self.d)
           
         bNames = self.idSamples(nb)
         meanNames = np.array(bNames)[np.where(['MEAN: ' in i for i in bNames])].tolist()
@@ -1495,7 +1149,7 @@ Generated with:
         return np.array(mean),np.array(sd),np.array(n),np.array(l)
 
 
-    def writeNetCdf(self,ns,nl,nb,mean,sd,n,land,snowType,p,doy):
+    def writeNetCdf(self,ns,nl,nb,mean,sd,n,land,snowType,doy):
         """
 
         write mean and var/covar of MODIS albedo datasets to file (NetCDF format)
@@ -1523,8 +1177,6 @@ Generated with:
                land mask
         snowType : string
                e.g. SnowAndNoSnow, used in filename
-        p : integer
-             image part number
         doy  : string
              DOY string e.g. 009
 
@@ -1535,18 +1187,17 @@ Generated with:
 
         """
 
-        p = '%02d'%p
-        shrink = self.ip.shrink
+        shrink = self.shrink
         doy = '%03d'%int(doy)
 
         filename = self.ip.opdir + '/Kernels.' + doy + '.' + self.ip.version + '.' +\
-                                 self.ip.tile + '.' + snowType +'.'+ p + '.nc'
+                                 self.ip.tile + '.' + snowType +'.nc'
 
         bNames = self.idSamples(nb)
         bNames.append('Weighted number of samples')
         bNames.append('land mask')
      
-        logging.info( 'writing %s'%filename,extra=self.d)
+        self.logging.info( 'writing %s'%filename,extra=self.d)
         if nb == 2:
             defBands = [4,1,1]
         elif nb == 7:
@@ -1566,26 +1217,19 @@ Generated with:
         count = 0
         for i in range(nb):
             for j in range(3):
-                shrunkMean = mean[i,:,:,j]
-                shrunkSd = sd[i,:,:,j]
-                #shrunkMean,shrunkSd = self.shrunk(mean[i,:,:,j],ns,nl,shrink,sdata=sd[i,:,:,j])
                 data = ncfile.createVariable(bNames[count],'f4',('ns','nl'),zlib=True,least_significant_digit=10)
-                data[:] = shrunkMean
+                data[:] = mean[j,i]
                 count = count +1
                 data = ncfile.createVariable(bNames[count],'f4',('ns','nl'),zlib=True,least_significant_digit=10)
-                data[:] = shrunkSd
+                data[:] = sd[j,i]
                 count = count + 1
       
-        shrunkN = n[0,:,:,0] 
-        #shrunkN = self.shrunk(n[0,:,:,0],ns,nl,shrink)
         data = ncfile.createVariable(bNames[count],'f4',('ns','nl'),zlib=True,least_significant_digit=10)
-        data[:] = shrunkN
+        data[:] = weight
         count = count + 1
         
-        shrunkLand = land
-        #shrunkLand = self.shrunk(land,ns,nl,shrink)
         data = ncfile.createVariable(bNames[count],'f4',('ns','nl'),zlib=True,least_significant_digit=2)
-        data[:] = shrunkLand
+        data[:] = land
 
         setattr(ncfile,'description',descrip)
         setattr(ncfile,'data ignore value',-1.0)
@@ -1600,7 +1244,7 @@ Generated with:
             from subprocess import call
             call(['gzip','-f',filename])
           except:
-            logging.info( "Failed to compress output file %s"%filename,extra=self.d)
+            self.logging.info( "Failed to compress output file %s"%filename,extra=self.d)
     
 
     def runAll(self):
@@ -1628,10 +1272,10 @@ Generated with:
         self.nDays = len(self.doyList)
         self.nYears = len(self.years)
          
-        logging.info( 'N Years = %d; N Days = %d'%(self.nYears,self.nDays),extra=self.d)
+        self.logging.info( 'N Years = %d; N Days = %d'%(self.nYears,self.nDays),extra=self.d)
 
-        logging.info(str(self.doyList),extra=self.d)
-        logging.info('file compression: %s'%str(self.ip.compression),extra=self.d)
+        self.logging.info(str(self.doyList),extra=self.d)
+        self.logging.info('file compression: %s'%str(self.ip.compression),extra=self.d)
 
         isRST = False
         if self.ip.rstdir != 'None':
@@ -1642,7 +1286,7 @@ Generated with:
             if os.path.exists(self.ip.rstdir) == 0:
               os.makedirs(self.ip.rstdir)
           except:
-            logging.info("failed to load pylab or create required directory: required for rst output",extra=self.d)
+            self.logging.info("failed to load pylab or create required directory: required for rst output",extra=self.d)
             self.ip.rstdir = 'None'
             isRST = False
 
@@ -1654,7 +1298,7 @@ Generated with:
 
         ok = True
         for doy in doyList:
-          logging.info("DOY %s"%str(doy),extra=self.d)
+          self.logging.info("DOY %s"%str(doy),extra=self.d)
           dimy=2400
           biny=dimy/self.ip.part
 
@@ -1694,14 +1338,14 @@ Generated with:
           # don't do multiple parts as yet .. use --sdmims instead
           if not ok: 
            for p in range(self.ip.part):
-            logging.info( "\n\n-------- partition %d/%d --------"%(p,self.ip.part),extra=self.d)
+            self.logging.info( "\n\n-------- partition %d/%d --------"%(p,self.ip.part),extra=self.d)
             y0=p*biny
             #sdimsL=[-1, -1, -1, -1]
-            sdimsL = self.ip.sdims
+            sdimsL = self.sdims
             if self.ip.part>1:
               sdimsL[2]=y0
               sdimsL[3]=biny
-            logging.info("sub region: %s"%str(sdimsL),extra=self.d)
+            self.logging.info("sub region: %s"%str(sdimsL),extra=self.d)
 
             processed,totalSnow,sumDataNoSnow,sumDataSnow,sumDataWithSnow,nb,ns,nl,land = \
                                 self.processAlbedo(self.years,[doy],sdimsL)
@@ -1711,7 +1355,7 @@ Generated with:
               ns /= self.ip.shrink
               nl /= self.ip.shrink
 
-              logging.info('... calculating stats',extra=self.d)
+              self.logging.info('... calculating stats',extra=self.d)
               n = np.zeros((nb,ns,nl,3),dtype=np.float32)
               mean = np.zeros((nb,ns,nl,3),dtype=np.float32)
               sdData = np.zeros((nb,ns,nl,3),dtype=np.float32)
@@ -1743,54 +1387,35 @@ def processArgs(args=None,parser=None):
     parser = parser or OptionParser(usage=usage)
     prog = 'logger'
 
-    # Lewis: add defaults here
-
-    parser.add_option('--clean',dest='clean',action='store_true',default=False,\
-                      help="ignore previous cdf files")
-    parser.add_option('--dontclean',dest='clean',action='store_false',\
-                      help="read previous cdf files if available (default action)")
-    parser.add_option('--logfile',dest='logfile',type='string',default='%s.log'%(prog),\
+    parser.add_option('--logfile',dest='logfile',type='string',default=None,\
                       help="set log file name") 
     parser.add_option('--logdir',dest='logdir',type='string',default='logs',\
                       help="set log directory name")
-    parser.add_option('--rst',dest='rstdir',type='string',default='None',\
-                      help="Write out an rst file with the processed data")
-    parser.add_option('--srcdir',dest='srcdir',type='string',default='modis',\
+    parser.add_option('--srcdir',dest='srcdir',type='string',default='files',\
                       help="Source (MODIS MCD43) data directory")
     parser.add_option('--tile',dest='tile',type='string',default='h18v03',\
                       help="MODIS tile ID")
-    parser.add_option('--backupscale',dest='backupscale',type='string',default='[1.,0.7,0.49,0.343]',\
-                      help="Array defining the scale to map MODIS QA flags to, e.g. [1.,0.7,0.49,0.343]")
+    parser.add_option('--backupscale',dest='backupscale',type='float',default=0.61803398875,\
+                      help="Array defining the scale to map MODIS QA flags to, e.g. 0.61803398875")
     parser.add_option('--opdir',dest='opdir',type='string',default='results',\
                       help="Output directory")
     parser.add_option('--compression',dest='compression',action='store_true',default=True,\
                       help='Compress output file')
-    parser.add_option('--dontsnow',dest='dontsnow',action='store_true',default=True,\
-                      help="Don't output snow prior")
-    parser.add_option('--dontwithsnow',dest='dontwithsnow',action='store_true',default=False,\
-                      help="Dont output prior with snow and no snow data. Default False (i.e. do process this)") 
-    parser.add_option('--dontnosnow',dest='dontnosnow',action='store_true',default=True,\
-                      help="Don't output prior with no snow (i.e. snow free) data")
+    parser.add_option('--snow',dest='snow',action='store_true',default=True,\
+                      help="op snow data")
+    parser.add_option('--no_snow',dest='no_snow',action='store_true',default=True,\
+                      help="op no_snow data") 
     parser.add_option('--nocompression',dest='compression',action='store_false',\
                       help="Don't compress output file")
-    parser.add_option('--snow',dest='dontsnow',action='store_false',\
-                      help="Do output snow prior")
-    parser.add_option('--withsnow',dest='dontwithsnow',action='store_false',\
-                      help="Do output prior with snow and no snow data")
-    parser.add_option('--nosnow',dest='dontnosnow',action='store_false',\
-                      help="Do output prior with no snow (i.e. snow free) data")
     parser.add_option('--shrink',dest='shrink',type='int',default=1,\
                       help="Spatial shrink factor (integer: default 1)")
-    parser.add_option('--sdims',dest='sdims',type='string',default='[-1,-1,-1,-1]',\
+    parser.add_option('--sdim',dest='sdim',type='string',default='[-1,-1,-1,-1]',\
                       help='image subsection: default [-1,-1,-1,-1]i or [l0,nl,s0,ns]')
-    parser.add_option('--bands',dest='bands',type='string',default='[7,8,9]',help='list of bands to process. Default [7,8,9]')
+    parser.add_option('--bands',dest='bands',type='string',default='[0,1,2,3,4,5,6]',help='list of bands to process. Default [0,1,2,3,4,5,6]')
     parser.add_option('--years',dest='years',type='string',default=\
-                              '[2000,2001,2002,2003,2004,2005,2006,2007,2008,2009,2010,2011,2012,2013]',help='list of years to process')
-    parser.add_option('--focus',dest='focus',type='string',default='[1.,1,1,1,1,1,1,1,1,1,1,1,1]',help='weighting for each year used')
+                              '[2000,2001,2002,2003,2004,2005,2006,2007,2008,2009,2010,2011,2012,2013,2014,2015,2016]',help='list of years to process')
     parser.add_option('--version',dest='version',type='string',default='005',help='MODIS collection number (as string). Default 005')
-    parser.add_option('--product',dest='product',type='string',default='mcd43a',help='product name (default mcd43a)')
-    parser.add_option('--part',dest='part',type='int',default=1,help='How many parts to split the tile into (default 1)')
-    parser.add_option('--rstbase',dest='basename',type='string',default='Kernels',help='root name for ReST files')
+    parser.add_option('--product',dest='product',type='string',default='MCD43A',help='product name (default MCD43A)')
     parser.add_option('--doy',dest='doyList',type='string',default='None',help='list of doys to process e.g. "[1,9]". N.B. do not put leading zeros on the dates (e.g. do not use e.g. [001,009])')
 
     
@@ -1801,16 +1426,151 @@ if __name__ == '__main__':
     opts, args = processArgs()
 
     # Lewis: need str at times on the eval 
-    opts.backupscale = np.array(ast.literal_eval(opts.backupscale))
-    opts.sdims       = np.array(ast.literal_eval(opts.sdims))
+    opts.sdim       = np.array(ast.literal_eval(opts.sdim))
     opts.bands       = np.array(ast.literal_eval(opts.bands))
     opts.years       = np.array(ast.literal_eval(opts.years))
-    opts.focus       = np.array(ast.literal_eval(opts.focus))
     opts.doyList = np.array(ast.literal_eval(opts.doyList)) 
 
     #class call
-    albedo = albedo_pix(opts)
+    self = prep_modis(opts)
+    import pdb;pdb.set_trace()
 
-    albedo.runAll()
+    # full unique day and year list
+    doyList, yearList = self.getDates(self.a1Files)
 
-        
+    # loop over days
+    for d in doyList:
+      # open output file
+      ncfile = None
+
+      # which files for these years & this doy
+      a1,a2 = self.getValidFiles(yearList,d)
+      dummy = False
+      mask = np.zeros(len(a1)).astype(object);mask[:] = None
+      for i,b in enumerate(self.bands):
+        for j,(A1,A2) in enumerate(zip(a1,a2)):
+          # read some data
+          mask[j] = self.translate(A1,A2,bands=[b],data=mask[j])
+          s0,ns,l0,nl = mask[j]['limits']
+
+          if ncfile == None:
+            snowType = (self.snow and self.no_snow and 'SnowAndNoSnow') or\
+                                      (self.snow and 'Snow') or\
+                                      (self.no_snow and 'NoSnow')
+
+            filename = self.opdir + '/Kernels.' + '%03d'%int(d) + '.' + self.version + '.' +\
+                                 self.tile + '.' + snowType +'.nc'
+
+            ncfile = nc.Dataset(filename,'w',format = 'NETCDF3_CLASSIC')
+
+            ncfile.createDimension('ns',ns)
+            ncfile.createDimension('nl',nl)
+
+            descrip = snowType + ' MODIS Mean/SD ' + d + ' over the years ' + str(yearList)  + \
+                ' version ' + self.version + ' tile '+ self.tile + \
+                ' using input MODIS bands '
+            for band in self.bands:
+              descrip = descrip + str(band) + ' '
+
+            nb = len(self.bands)
+            if nb == 2:
+              defBands = [4,1,1]
+            elif nb == 7:
+              defBands = [1,14,19]
+            else:
+              defBands = [1,10,7]
+
+            setattr(ncfile,'description',descrip)
+            setattr(ncfile,'data ignore value',-1.0)
+            setattr(ncfile,'default bands',defBands)
+
+          # allocate storage
+          if 'f0' not in locals():
+            f0 = np.zeros((len(a1),ns,nl)).astype(np.uint16)
+            f1 = f0.copy()
+            f2 = f0.copy()
+            snow = f0.copy().astype(bool)
+            no_snow = f0.copy().astype(bool)
+            land = f0.copy().astype(np.uint8)
+            weight = f0.copy()
+
+          if mask[j] == None:
+            goodData = False
+            if dummy == False:
+              dummy = np.zeros((ns,nl)).astype(np.uint16);
+            f0[j] = f1[j] = f2[j] = dummy
+          else:
+            goodData = True
+       
+            # store the reflectance data for band i
+            # and year implied by A1,A2
+            f0[j] = mask[j]['data'][0,0]
+            f1[j] = mask[j]['data'][1,0]
+            f2[j] = mask[j]['data'][2,0]
+          # delete
+          del mask[j]['data']
+          if i == 0:
+            if not goodData:
+              if dummy == False:
+                s0,ns,l0,nl = mask[j]['limits']
+                dummy = np.zeros((ns,nl)).astype(np.uint16);
+              weight[j] = dummy
+              land[j] = dummy.astype(np.uint8)
+              snow[j] = no_snow[j] = dummy.astype(bool)
+            # store in list
+            weight[j] = mask[j]['weight']
+            land[j] = mask[j]['land']
+            snow[j] = mask[j]['snow_mask']
+            no_snow[j] = mask[j]['no_snow_mask']
+
+        import pdb;pdb.set_trace()
+
+        if i == 0:
+          # now we have read all of the data for one band for all years
+          # for the given day
+
+          # sort the land mask (categories 1,2,3)
+          landed = ma.array(land,mask=(land==0))
+          tt = ma.array(np.zeros((3,ns,nl)))
+          for k,t in enumerate([1,2,3]):
+            tt[k] = np.sum((landed == t)*weight,axis=0)
+          ttmask = tt.sum(axis=0) == 0
+          # this is the summary land mask
+          landed = ma.array(np.argmax(tt,axis=0)+1,mask=ttmask)
+          
+          ds = ncfile.createVariable('land mask','i1',('ns','nl'),zlib=True)
+          ds[:] = landed
+
+          land_mask = np.array([ttmask.mask]*weight.shape[0]).astype(bool)
+
+          # generate 3 types of weight:
+          # rescale
+          weight = weight.astype(float) * 0.001  
+          if self.snow and self.no_snow:
+            weight = ma.array(weight,mask=~((snow|no_snow) & ~land_mask))
+            sum_weight = weight.sum(axis=0)
+          elif self.snow:
+            weight = ma.array(weight,mask=~((snow) & ~land_mask))
+            sum_weight = weight.sum(axis=0)
+          elif self.no_snow:
+            weight = ma.array(weight,mask=~((no_snow) & ~land_mask))
+            sum_weight = weight.sum(axis=0)
+       
+        params   = [None]*3
+        params_sd = [None]*3
+
+        for k,f in enumerate([f0,f1,f2]):
+          f = f*0.001
+          f_mean = (f * weight).sum(axis=0) / sum_weight
+          diff = f - f_mean
+          f_var = np.sum(weight * diff * diff ,axis=0) / ( sum_weight - 1.)
+          f_var[f_var<0] = np.sqrt(np.max([1.0,f_var.max()]))
+          params[k], params_sd[k] = self.shrunk(f_mean,ns,nl,self.shrink,sdata=np.sqrt(f_var))
+
+      # reset the arrays
+      f0[:] = f1[:] = f2[:] = weight[:] = 0
+      snow[:] = no_snow[:] = False
+      land = np.array(land);land[:] = 0
+      ncfile.close()
+
+
